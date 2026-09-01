@@ -97,9 +97,38 @@ def find_map_file(bsp):
     return None
 
 
+def match_init_array_entry(lines, i):
+    """
+    match a .init_array* input section at lines[i]; returns
+    ((name, addr, size, module), consumed_lines) or (None, 0).
+    GNU ld may wrap a long section name onto its own line, with the
+    address/size/module on the next line, so handle both forms.
+    """
+    entry = re.match(r'^\s+(\.init_array\S*)\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s*(.*)', lines[i])
+    if entry:
+        return (entry.group(1), int(entry.group(2), 16), int(entry.group(3), 16),
+                entry.group(4).strip()), 1
+
+    wrapped = re.match(r'^\s+(\.init_array\S+)\s*$', lines[i])
+    if wrapped and i + 1 < len(lines):
+        detail = re.match(r'^\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s*(.*)', lines[i + 1])
+        if detail:
+            return (wrapped.group(1), int(detail.group(1), 16), int(detail.group(2), 16),
+                    detail.group(3).strip()), 2
+
+    return None, 0
+
+
 def analyze_map(map_path):
     """
     parse a GNU ld map file for .init_array / ctor related information.
+
+    Handles both layouts:
+    - a dedicated `.init_array` output section at column 0;
+    - `.init_array*` input sections nested inside another output section
+      (e.g. RT-Thread linker scripts often KEEP them inside .data).
+    Also checks the "Discarded input sections" block: .init_array entries
+    collected there mean --gc-sections would drop real ctors (missing KEEP).
     """
     result = {
         'ctors_start': False,
@@ -107,7 +136,8 @@ def analyze_map(map_path):
         'cplusplus_init': False,
         'init_array_addr': None,
         'init_array_size': None,
-        'init_array_entries': [],
+        'init_array_entries': [],    # dicts: name, addr, size, output, module
+        'init_array_discarded': [],  # .init_array* input section names gc'ed
     }
 
     with open(map_path, 'r', errors='ignore') as file:
@@ -121,15 +151,39 @@ def analyze_map(map_path):
     if match:
         result['init_array_addr'] = int(match.group(1), 16)
         result['init_array_size'] = int(match.group(2), 16)
-        # input section lines are indented under the output section header,
-        # stop at the next non-indented (next output section) line
-        for line in text[match.end():].splitlines():
-            if line.strip() == '':
+
+    discarded = re.search(r'^Discarded input sections\n(.*?)\n\n', text, re.S | re.M)
+    if discarded:
+        lines = discarded.group(1).splitlines()
+        i = 0
+        while i < len(lines):
+            entry, consumed = match_init_array_entry(lines, i)
+            if entry:
+                result['init_array_discarded'].append(
+                    f'{entry[0]} ({entry[3]})' if entry[3] else entry[0])
+            i += consumed or 1
+
+    memory_map = text.split('Linker script and memory map', 1)
+    if len(memory_map) == 2:
+        lines = memory_map[1].splitlines()
+        current_output = None
+        i = 0
+        while i < len(lines):
+            output_sec = re.match(r'^(\.\S+)\s+0x[0-9a-fA-F]+', lines[i])
+            if output_sec:
+                current_output = output_sec.group(1)
+                i += 1
                 continue
-            if re.match(r'^\S', line):
-                break
-            if re.match(r'^\s+\.init_array', line):
-                result['init_array_entries'].append(line.strip())
+            entry, consumed = match_init_array_entry(lines, i)
+            if entry:
+                result['init_array_entries'].append({
+                    'name': entry[0],
+                    'addr': entry[1],
+                    'size': entry[2],
+                    'output': current_output,
+                    'module': entry[3],
+                })
+            i += consumed or 1
 
     return result
 
@@ -202,28 +256,41 @@ if __name__ == "__main__":
             continue
 
         info = analyze_map(map_path)
+        ctors_ok = info['ctors_start'] and info['ctors_end']
         details = [
             f"map: `{os.path.relpath(map_path, rtt_root)}`",
-            f"ctors symbols: {'✅' if info['ctors_start'] and info['ctors_end'] else '❌ __ctors_start__/__ctors_end__ missing'}",
-            f"cplusplus_system_init: {'✅' if info['cplusplus_init'] else '❌ missing'}",
+            f"ctors symbols: {'✅' if ctors_ok else '⚠️ __ctors_start__/__ctors_end__ not in map'}",
+            f"cplusplus_system_init: {'✅' if info['cplusplus_init'] else '⚠️ not in map'}",
         ]
-        if info['init_array_size'] is None:
-            verdict = '⚠️'
-            details.append('.init_array: section not found in map')
-        else:
-            entry_count = len(info['init_array_entries'])
+        if info['init_array_size'] is not None:
             details.append(
-                f".init_array: addr 0x{info['init_array_addr']:x}, size 0x{info['init_array_size']:x}, {entry_count} input section(s)")
-            if info['init_array_size'] == 0:
-                verdict = '⚠️'
-                details.append('.init_array is empty, no ctor kept (check KEEP in linker script)')
-            else:
-                verdict = '✅'
-            if entry_count:
-                details.append('entries: ' + '; '.join(info['init_array_entries'][:10])
-                               + ('; ...' if entry_count > 10 else ''))
-        if not (info['ctors_start'] and info['ctors_end'] and info['cplusplus_init']):
+                f".init_array output section: addr 0x{info['init_array_addr']:x}, size 0x{info['init_array_size']:x}")
+
+        entries = info['init_array_entries']
+        if entries:
+            total_size = sum(e['size'] for e in entries)
+            outputs = sorted({e['output'] for e in entries if e['output']})
+            details.append(f"{len(entries)} ctor entry(ies), total 0x{total_size:x} byte(s), in {', '.join(outputs)}")
+            preview = '; '.join(f"{e['name']} ({e['module']})" for e in entries[:5])
+            details.append('entries: ' + preview + ('; ...' if len(entries) > 5 else ''))
+        if info['init_array_discarded']:
+            details.append(f"{len(info['init_array_discarded'])} .init_array input section(s) discarded by --gc-sections: "
+                           + ', '.join(info['init_array_discarded'][:5]))
+
+        if not (ctors_ok and info['cplusplus_init']):
             verdict = '⚠️'
+            details.append('ctor init plumbing not visible in map')
+        elif info['init_array_discarded']:
+            verdict = '⚠️'
+            details.append('ctors would be dropped by --gc-sections, linker script needs KEEP(*(.init_array*))')
+        elif entries:
+            verdict = '✅'
+        elif info['init_array_size'] is not None:
+            verdict = '✅'
+            details.append('no ctor entries (nothing to run, plumbing OK)')
+        else:
+            verdict = '⚠️'
+            details.append('no .init_array output section or input entries found in map')
 
         report_bsp(report_lines, bsp, verdict, '; '.join(details))
         print("::endgroup::")
