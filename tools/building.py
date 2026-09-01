@@ -280,6 +280,12 @@ def PrepareBuilding(env, root_directory, has_libcpu=False, remove_components = [
         _apply_exec_path_override(env, exec_path)
     _normalize_armclang_flags_for_host(env)
 
+    # CI hook: generate a linker map file (for .init_array/ctor analysis) when
+    # RTT_GEN_MAP_FILE is set; gcc only, and skipped when the BSP already has -Map=
+    rtt_map_file = os.getenv('RTT_GEN_MAP_FILE')
+    if rtt_map_file and rtconfig.PLATFORM in ['gcc'] and '-Map=' not in str(env.get('LINKFLAGS', '')):
+        env.AppendUnique(LINKFLAGS=' -Wl,-Map=' + rtt_map_file)
+
     # some env variables have loaded in Environment() of SConstruct before re-load rtconfig.py;
     # after update rtconfig.py's variables, those env variables need to synchronize
     if exec_prefix:
