@@ -27,6 +27,7 @@ Usage:
         python tools/ci/bsp_cpp_ctor_check.py
 """
 import glob
+import gzip
 import os
 import re
 import shutil
@@ -129,6 +130,9 @@ def analyze_map(map_path):
       (e.g. RT-Thread linker scripts often KEEP them inside .data).
     Also checks the "Discarded input sections" block: .init_array entries
     collected there mean --gc-sections would drop real ctors (missing KEEP).
+    Finally resolves the addresses of __ctors_start__/__ctors_end__ (the range
+    walked by cplusplus_system_init) and __init_array_start/__init_array_end,
+    so the caller can check whether the walked range covers .init_array.
     """
     result = {
         'ctors_start': False,
@@ -138,6 +142,7 @@ def analyze_map(map_path):
         'init_array_size': None,
         'init_array_entries': [],    # dicts: name, addr, size, output, module
         'init_array_discarded': [],  # .init_array* input section names gc'ed
+        'sym_addr': {},              # __ctors_start__ etc -> int address
     }
 
     with open(map_path, 'r', errors='ignore') as file:
@@ -146,6 +151,16 @@ def analyze_map(map_path):
     result['ctors_start'] = '__ctors_start__' in text
     result['ctors_end'] = '__ctors_end__' in text
     result['cplusplus_init'] = 'cplusplus_system_init' in text
+
+    # symbol addresses, from both the memory map (PROVIDE lines) and the
+    # symbol table at the end of the map; first occurrence wins
+    for sym_match in re.finditer(
+            r'0x([0-9a-fA-F]+)\s+(?:PROVIDE\s*\()?\s*'
+            r'(__ctors_start__|__ctors_end__|__init_array_start|__init_array_end)'
+            r'\s*(?:=\s*\.)?\s*\)?\s*$', text, re.M):
+        name = sym_match.group(2)
+        if name not in result['sym_addr']:
+            result['sym_addr'][name] = int(sym_match.group(1), 16)
 
     match = re.search(r'^\.init_array\s+0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)', text, re.M)
     if match:
@@ -186,6 +201,46 @@ def analyze_map(map_path):
             i += consumed or 1
 
     return result
+
+
+def analyze_linker_scripts(bsp):
+    """
+    statically scan the BSP linker scripts for the ctor auto-load plumbing.
+
+    cplusplus_system_init() walks [__ctors_start__, __ctors_end__), while GCC
+    places static C++ constructors in .init_array. The linker script must
+    therefore keep .init_array *between* __ctors_start__ and __ctors_end__.
+
+    returns a list of dicts: script, has_ctors_syms, has_init_array, covered
+    (covered=None when the script has no init_array handling at all).
+    """
+    findings = []
+    bsp_dir = os.path.join(rtt_root, 'bsp', bsp)
+    for root, dirs, files in os.walk(bsp_dir):
+        dirs[:] = [d for d in dirs if d not in ('packages', 'build', 'dist')]
+        for filename in files:
+            if not filename.endswith(('.ld', '.lds')):
+                continue
+            path = os.path.join(root, filename)
+            with open(path, 'r', errors='ignore') as file:
+                text = file.read()
+            if '__ctors_start__' not in text and '.init_array' not in text:
+                continue
+
+            finding = {
+                'script': os.path.relpath(path, bsp_dir),
+                'has_ctors_syms': '__ctors_start__' in text and '__ctors_end__' in text,
+                'has_init_array': '.init_array' in text,
+                'covered': None,
+            }
+            if finding['has_ctors_syms'] and finding['has_init_array']:
+                pos_start = text.find('__ctors_start__')
+                pos_end = text.find('__ctors_end__')
+                pos_init = text.find('.init_array')
+                finding['covered'] = pos_start < pos_init < pos_end
+            findings.append(finding)
+
+    return findings
 
 
 def report_bsp(report_lines, bsp, verdict, details):
@@ -255,6 +310,13 @@ if __name__ == "__main__":
             print("::endgroup::")
             continue
 
+        # keep the map (gzipped) in the artifact for offline inspection
+        maps_dir = os.path.join(rtt_root, REPORT_DIR, 'maps')
+        os.makedirs(maps_dir, exist_ok=True)
+        with open(map_path, 'rb') as fin, \
+                gzip.open(os.path.join(maps_dir, bsp.replace('/', '_') + '.map.gz'), 'wb') as fout:
+            shutil.copyfileobj(fin, fout)
+
         info = analyze_map(map_path)
         ctors_ok = info['ctors_start'] and info['ctors_end']
         details = [
@@ -277,14 +339,40 @@ if __name__ == "__main__":
             details.append(f"{len(info['init_array_discarded'])} .init_array input section(s) discarded by --gc-sections: "
                            + ', '.join(info['init_array_discarded'][:5]))
 
+        # the range walked by cplusplus_system_init() is
+        # [__ctors_start__, __ctors_end__), but GCC emits static C++
+        # constructors into .init_array - check the coverage
+        sym = info['sym_addr']
+        walk_start = sym.get('__ctors_start__')
+        walk_end = sym.get('__ctors_end__')
+        range_known = walk_start is not None and walk_end is not None
+        out_of_range = []
+        if range_known:
+            details.append(f"ctor walk range: [0x{walk_start:x}, 0x{walk_end:x})")
+            out_of_range = [e for e in entries if not (walk_start <= e['addr'] < walk_end)]
+
+        uncovered_scripts = [
+            f['script'] for f in analyze_linker_scripts(bsp)
+            if f['covered'] is False
+        ]
+
         if not (ctors_ok and info['cplusplus_init']):
             verdict = '⚠️'
             details.append('ctor init plumbing not visible in map')
         elif info['init_array_discarded']:
             verdict = '⚠️'
             details.append('ctors would be dropped by --gc-sections, linker script needs KEEP(*(.init_array*))')
+        elif out_of_range:
+            verdict = '❌'
+            details.append(f"{len(out_of_range)}/{len(entries)} ctor(s) in .init_array are outside the walked "
+                           '[__ctors_start__, __ctors_end__) range, cplusplus_system_init() will never call them')
         elif entries:
             verdict = '✅'
+        elif uncovered_scripts:
+            verdict = '⚠️'
+            details.append('latent: .init_array is outside the [__ctors_start__, __ctors_end__) range in '
+                           + ', '.join(uncovered_scripts)
+                           + '; any C++ static constructor would NOT be auto-run')
         elif info['init_array_size'] is not None:
             verdict = '✅'
             details.append('no ctor entries (nothing to run, plumbing OK)')
