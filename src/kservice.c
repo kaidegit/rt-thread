@@ -160,7 +160,7 @@ void rt_show_version(void)
 #endif
     rt_kprintf(" / | \\     %d.%d.%d build %s %s\n",
                (rt_int32_t)RT_VERSION_MAJOR, (rt_int32_t)RT_VERSION_MINOR, (rt_int32_t)RT_VERSION_PATCH, __DATE__, __TIME__);
-    rt_kprintf(" 2006 - 2024 Copyright by RT-Thread team\n");
+    rt_kprintf(" 2006 - 2026 Copyright by RT-Thread team\n");
 }
 RTM_EXPORT(rt_show_version);
 
@@ -1210,13 +1210,21 @@ RTM_EXPORT(rt_realloc);
 rt_weak void *rt_calloc(rt_size_t count, rt_size_t size)
 {
     void *p;
+    rt_size_t total_size;
+
+    if (size != 0 && count > RT_SIZE_MAX / size)
+    {
+        return RT_NULL;
+    }
+
+    total_size = count * size;
 
     /* allocate 'count' objects of size 'size' */
-    p = rt_malloc(count * size);
+    p = rt_malloc(total_size);
     /* zero the memory */
     if (p)
     {
-        rt_memset(p, 0, count * size);
+        rt_memset(p, 0, total_size);
     }
     return p;
 }
